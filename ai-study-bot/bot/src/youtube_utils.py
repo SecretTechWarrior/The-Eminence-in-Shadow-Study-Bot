@@ -15,12 +15,12 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------
-# VIDEO ID EXTRACTION
+# VIDEO ID EXTRACTION (ROBUST)
 # ---------------------------
 def extract_video_id(url: str) -> str | None:
     patterns = [
-        r'(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})',
-        r'^([a-zA-Z0-9_-]{11})$'
+        r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([a-zA-Z0-9_-]{11})",
+        r"^([a-zA-Z0-9_-]{11})$"
     ]
 
     for pattern in patterns:
@@ -35,40 +35,41 @@ def extract_video_id(url: str) -> str | None:
 # PLAYLIST ID
 # ---------------------------
 def extract_playlist_id(url: str) -> str | None:
-    match = re.search(r'[?&]list=([a-zA-Z0-9_-]+)', url)
+    match = re.search(r"[?&]list=([a-zA-Z0-9_-]+)", url)
     return match.group(1) if match else None
 
 
 # ---------------------------
-# TRANSCRIPT (STABLE + SAFE)
+# TRANSCRIPT (FULLY FIXED)
 # ---------------------------
 async def get_transcript(video_id: str) -> tuple[list, str]:
 
     def _fetch():
+        # -------------------------
+        # METHOD 1: NEW API (v1+)
+        # -------------------------
         try:
-            # =========================
-            # METHOD 1: NEW API (safe)
-            # =========================
-            try:
-                ytt_api = YouTubeTranscriptApi()
+            ytt = YouTubeTranscriptApi()
+            transcript = ytt.fetch(video_id)
 
-                transcript_obj = ytt_api.fetch(video_id)
+            data = [
+                {
+                    "text": t.text,
+                    "start": t.start,
+                    "duration": t.duration,
+                }
+                for t in transcript
+            ]
 
-                return [
-                    {
-                        "text": entry.text,
-                        "start": entry.start,
-                        "duration": entry.duration,
-                    }
-                    for entry in transcript_obj
-                ]
+            return data
 
-            except Exception as e:
-                logger.warning(f"New API failed, falling back: {e}")
+        except Exception as e:
+            logger.warning(f"New API failed, trying legacy: {e}")
 
-            # =========================
-            # METHOD 2: OLD API
-            # =========================
+        # -------------------------
+        # METHOD 2: LEGACY API
+        # -------------------------
+        try:
             return YouTubeTranscriptApi.get_transcript(
                 video_id,
                 languages=["en", "en-US", "en-GB"]
@@ -85,11 +86,20 @@ async def get_transcript(video_id: str) -> tuple[list, str]:
 
     transcript_list = await asyncio.to_thread(_fetch)
 
-    # normalize text safely
+    # -------------------------
+    # SAFE NORMALIZATION
+    # -------------------------
     full_text = " ".join(
-        str(entry.get("text", "") if isinstance(entry, dict) else entry.text)
+        (
+            entry["text"]
+            if isinstance(entry, dict)
+            else getattr(entry, "text", "")
+        )
         for entry in transcript_list
     ).strip()
+
+    if not full_text:
+        raise ValueError("Transcript is empty for this video.")
 
     return transcript_list, full_text
 
@@ -111,11 +121,10 @@ async def get_video_title(video_id: str) -> str:
         )
 
         if response.status_code == 200:
-            data = response.json()
-            return data.get("title", f"Video {video_id}")
+            return response.json().get("title", f"Video {video_id}")
 
     except Exception as e:
-        logger.warning(f"Could not get video title: {e}")
+        logger.warning(f"Title fetch failed: {e}")
 
     return f"YouTube Video ({video_id})"
 
@@ -132,9 +141,6 @@ async def get_video_info(url: str) -> dict:
     title = await get_video_title(video_id)
     transcript_list, full_text = await get_transcript(video_id)
 
-    if not full_text:
-        raise ValueError("Transcript is empty for this video.")
-
     return {
         "video_id": video_id,
         "url": url,
@@ -143,7 +149,8 @@ async def get_video_info(url: str) -> dict:
         "transcript_text": full_text,
         "duration_estimate": (
             transcript_list[-1].get("start", 0)
-            if transcript_list else 0
+            if transcript_list and isinstance(transcript_list[-1], dict)
+            else 0
         ),
     }
 
