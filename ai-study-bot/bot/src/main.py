@@ -1,6 +1,7 @@
 import sys
 import os
 import logging
+import re
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,59 +32,67 @@ from handlers.audio import audio_command
 from handlers.explain import explain_command, ask_command
 from handlers.playlist import playlist_command
 
+
 # Logging
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def is_youtube_link(text: str) -> bool:
+    if not text:
+        return False
+    return bool(re.search(r"(youtube\.com|youtu\.be)", text))
+
+
 async def error_handler(update: object, context) -> None:
     logger.error("Exception while handling update:", exc_info=context.error)
-    if isinstance(update, Update) and update.effective_message:
-        try:
+
+    try:
+        if isinstance(update, Update) and update.effective_message:
             await update.effective_message.reply_text(
-                "⚠️ An unexpected error occurred. Please try again.\n"
-                "If this keeps happening, try /start to reset."
+                "⚠️ Something went wrong. Try again or use /start."
             )
-        except Exception:
-            pass
+    except Exception:
+        pass
 
 
 async def unknown_command(update: Update, context) -> None:
-    await update.message.reply_text(
-        "❓ Unknown command. Use /help to see all available commands.",
-        parse_mode="Markdown"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "❓ Unknown command. Use /help to see available commands."
+        )
 
 
 async def handle_url_message(update: Update, context) -> None:
-    """Handle messages that look like YouTube URLs sent without a command"""
-    text = update.message.text.strip()
-    if "youtube.com" in text or "youtu.be" in text:
+    text = update.message.text if update.message else ""
+
+    if not text:
+        return
+
+    text = text.strip()
+
+    if is_youtube_link(text):
         await update.message.reply_text(
-            "🎬 I see you sent a YouTube link!\n\n"
-            "What do you want to do with it?\n\n"
-            f"• `/notes {text}` — Detailed notes PDF\n"
-            f"• `/quiz {text}` — Generate quiz\n"
-            f"• `/summary {text}` — Quick summary\n"
-            f"• `/revise {text}` — Revision sheet\n"
-            f"• `/audio {text}` — Audio revision\n"
-            f"• `/formulas {text}` — Formula sheet\n"
-            f"• `/chapters {text}` — Chapter breakdown",
-            parse_mode="Markdown"
+            "🎬 YouTube link detected!\n\n"
+            "Choose what you want:\n\n"
+            f"• /notes {text}\n"
+            f"• /quiz {text}\n"
+            f"• /summary {text}\n"
+            f"• /revise {text}\n"
+            f"• /audio {text}\n"
+            f"• /formulas {text}\n"
+            f"• /chapters {text}"
         )
     else:
         await update.message.reply_text(
-            "💬 I only understand commands. Use /help to see what I can do!\n\n"
-            "Quick start: `/notes <youtube_link>`",
-            parse_mode="Markdown"
+            "💬 Send a YouTube link or use /help to see commands."
         )
 
 
@@ -95,9 +104,8 @@ def main():
     logger.info("Initializing database...")
     init_db()
 
-    logger.info("Starting AI Study Assistant Bot...")
+    logger.info("Starting bot...")
 
-    # Build with longer timeouts for stability on Render/Railway
     request = HTTPXRequest(
         connection_pool_size=8,
         read_timeout=60,
@@ -114,13 +122,12 @@ def main():
         .build()
     )
 
-    # Core commands
+    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("history", history_command))
 
-    # Video commands
     app.add_handler(CommandHandler("notes", notes_command))
     app.add_handler(CommandHandler("shortnotes", shortnotes_command))
     app.add_handler(CommandHandler("quiz", quiz_command))
@@ -130,26 +137,26 @@ def main():
     app.add_handler(CommandHandler("formulas", formulas_command))
     app.add_handler(CommandHandler("audio", audio_command))
 
-    # AI interaction commands
     app.add_handler(CommandHandler("explain", explain_command))
     app.add_handler(CommandHandler("ask", ask_command))
-
-    # Playlist
     app.add_handler(CommandHandler("playlist", playlist_command))
 
-    # Button callbacks
+    # Callback buttons
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    # Handle plain messages (YouTube URLs, unknown text)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_message))
+    # Messages
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url_message)
+    )
 
-    # Unknown commands
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    app.add_handler(
+        MessageHandler(filters.COMMAND, unknown_command)
+    )
 
     # Error handler
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Bot is running! Press Ctrl+C to stop.")
+    logger.info("✅ Bot running!")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
