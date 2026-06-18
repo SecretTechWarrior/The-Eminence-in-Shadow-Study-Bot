@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from openai import AsyncOpenAI
 from groq import AsyncGroq
@@ -16,115 +17,105 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# OPTIONAL GEMINI IMPORT
-# ---------------------------
+# Optional Gemini import
 GEMINI_AVAILABLE = False
 genai = None
 genai_types = None
 GEMINI_IMPORT_ERROR = None
 
 try:
-    import google.generativeai as genai  # legacy SDK
+    import google.generativeai as genai
     from google.generativeai import types as genai_types
-    GEMINI_AVAILABLE = True
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
+        GEMINI_AVAILABLE = True
 except Exception as e:
     GEMINI_IMPORT_ERROR = e
-    logger.warning(f"Gemini SDK unavailable, falling back to other providers: {e}")
+    logger.warning(f"Gemini unavailable: {e}")
 
-# ---------------------------
-# OPENROUTER
-# ---------------------------
-openrouter_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+# Lazy clients
+_openrouter_client = None
+_groq_client = None
 
-# ---------------------------
-# GROQ
-# ---------------------------
-groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+
+def get_openrouter_client():
+    global _openrouter_client
+    if _openrouter_client is None:
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+        _openrouter_client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
+    return _openrouter_client
+
+
+def get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        if not GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY is not set")
+        _groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+    return _groq_client
 
 
 async def ask_gemini(prompt: str, system: str = None) -> str:
     if not GEMINI_AVAILABLE or genai is None or genai_types is None:
         raise RuntimeError(f"Gemini unavailable: {GEMINI_IMPORT_ERROR}")
 
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not set")
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    full_prompt = f"{system}\n\n{prompt}" if system else prompt
 
-    try:
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        full_prompt = f"{system}\n\n{prompt}" if system else prompt
-
-        response = await asyncio.to_thread(
-            model.generate_content,
-            full_prompt,
-            generation_config=genai_types.GenerationConfig(
-                max_output_tokens=MAX_TOKENS,
-                temperature=0.7,
-            ),
-        )
-
-        return (response.text or "").strip()
-
-    except Exception as e:
-        logger.error(f"Gemini error: {e}")
-        raise
+    response = await asyncio.to_thread(
+        model.generate_content,
+        full_prompt,
+        generation_config=genai_types.GenerationConfig(
+            max_output_tokens=MAX_TOKENS,
+            temperature=0.7,
+        ),
+    )
+    return (response.text or "").strip()
 
 
 async def ask_openrouter(prompt: str, system: str = None) -> str:
-    try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+    client = get_openrouter_client()
 
-        response = await openrouter_client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.error(f"OpenRouter error: {e}")
-        raise
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    response = await client.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=messages,
+        max_tokens=MAX_TOKENS,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 async def ask_groq(prompt: str, system: str = None) -> str:
-    try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+    client = get_groq_client()
 
-        response = await groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            max_tokens=MAX_TOKENS,
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as e:
-        logger.error(f"Groq error: {e}")
-        raise
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    response = await client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        max_tokens=MAX_TOKENS,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 async def ask_ai(prompt: str, system: str = None, prefer: str = "gemini") -> str:
-    """
-    Try AI models in order with fallback:
-    gemini -> openrouter -> groq
-    If Gemini is unavailable on this host, it is skipped automatically.
-    """
     errors = []
 
     if prefer == "gemini":
         order = [ask_gemini, ask_openrouter, ask_groq]
     elif prefer == "groq":
-        order = [ask_groq, ask_openrouter]
-        if GEMINI_AVAILABLE:
-            order.append(ask_gemini)
+        order = [ask_groq, ask_openrouter, ask_gemini]
     else:
         order = [ask_openrouter, ask_gemini, ask_groq]
 
