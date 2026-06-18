@@ -1,13 +1,14 @@
 import re
 import asyncio
 import logging
+import requests
+
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     TranscriptsDisabled,
     NoTranscriptFound,
 )
 
-import requests
 from config import YOUTUBE_API_KEY
 
 logger = logging.getLogger(__name__)
@@ -39,47 +40,55 @@ def extract_playlist_id(url: str) -> str | None:
 
 
 # ---------------------------
-# TRANSCRIPT (FIXED & STABLE)
+# TRANSCRIPT (STABLE + SAFE)
 # ---------------------------
 async def get_transcript(video_id: str) -> tuple[list, str]:
-    """Stable transcript fetch (works across API versions)"""
 
     def _fetch():
         try:
-            # -----------------------
-            # NEW API STYLE (preferred)
-            # -----------------------
+            # =========================
+            # METHOD 1: NEW API (safe)
+            # =========================
             try:
                 ytt_api = YouTubeTranscriptApi()
-                transcript = ytt_api.fetch(video_id)
+
+                transcript_obj = ytt_api.fetch(video_id)
 
                 return [
                     {
-                        "text": t.text,
-                        "start": t.start,
-                        "duration": t.duration,
+                        "text": entry.text,
+                        "start": entry.start,
+                        "duration": entry.duration,
                     }
-                    for t in transcript
+                    for entry in transcript_obj
                 ]
-            except Exception:
-                pass
 
-            # -----------------------
-            # OLD API FALLBACK
-            # -----------------------
-            return YouTubeTranscriptApi.get_transcript(video_id)
+            except Exception as e:
+                logger.warning(f"New API failed, falling back: {e}")
+
+            # =========================
+            # METHOD 2: OLD API
+            # =========================
+            return YouTubeTranscriptApi.get_transcript(
+                video_id,
+                languages=["en", "en-US", "en-GB"]
+            )
 
         except TranscriptsDisabled:
             raise ValueError("Transcripts are disabled for this video.")
+
         except NoTranscriptFound:
             raise ValueError("No transcript found for this video.")
+
         except Exception as e:
             raise ValueError(f"Could not get transcript: {e}")
 
     transcript_list = await asyncio.to_thread(_fetch)
 
+    # normalize text safely
     full_text = " ".join(
-        entry.get("text", "") for entry in transcript_list
+        str(entry.get("text", "") if isinstance(entry, dict) else entry.text)
+        for entry in transcript_list
     ).strip()
 
     return transcript_list, full_text
@@ -91,7 +100,7 @@ async def get_transcript(video_id: str) -> tuple[list, str]:
 async def get_video_title(video_id: str) -> str:
     try:
         url = (
-            f"https://www.youtube.com/oembed"
+            "https://www.youtube.com/oembed"
             f"?url=https://youtube.com/watch?v={video_id}&format=json"
         )
 
@@ -112,13 +121,13 @@ async def get_video_title(video_id: str) -> str:
 
 
 # ---------------------------
-# MAIN VIDEO INFO FUNCTION
+# MAIN VIDEO INFO
 # ---------------------------
 async def get_video_info(url: str) -> dict:
     video_id = extract_video_id(url)
 
     if not video_id:
-        raise ValueError("Invalid YouTube URL. Please provide a valid video link.")
+        raise ValueError("Invalid YouTube URL. Please send a valid video link.")
 
     title = await get_video_title(video_id)
     transcript_list, full_text = await get_transcript(video_id)
@@ -162,6 +171,7 @@ async def get_playlist_videos(playlist_url: str) -> list[dict]:
 
     videos = []
     next_page_token = None
+
     base_url = "https://www.googleapis.com/youtube/v3/playlistItems"
 
     while True:
@@ -199,7 +209,6 @@ async def get_playlist_videos(playlist_url: str) -> list[dict]:
                 })
 
         next_page_token = data.get("nextPageToken")
-
         if not next_page_token:
             break
 
