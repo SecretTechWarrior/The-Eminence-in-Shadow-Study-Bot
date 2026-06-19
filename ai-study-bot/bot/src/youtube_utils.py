@@ -2,17 +2,15 @@ import re
 import asyncio
 import logging
 import requests
+import os
+import tempfile
 
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
-    NoTranscriptFound,
-)
+import yt_dlp
+from faster_whisper import WhisperModel
 
 from config import YOUTUBE_API_KEY
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------
 # VIDEO ID EXTRACTION
@@ -40,54 +38,82 @@ def extract_playlist_id(url: str) -> str | None:
 
 
 # ---------------------------
-# TRANSCRIPT (FIXED FOR NEW API)
+# METHOD 1: YT-DLP CAPTIONS
+# ---------------------------
+def _yt_dlp_captions(video_url: str):
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en"],
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+
+    subs = info.get("subtitles") or info.get("automatic_captions") or {}
+
+    if "en" not in subs:
+        return None
+
+    lines = subs["en"]
+    text = " ".join([x.get("text", "") for x in lines if isinstance(x, dict)])
+
+    return text.strip() or None
+
+
+# ---------------------------
+# METHOD 2: WHISPER TRANSCRIPTION
+# ---------------------------
+def _whisper_transcribe(video_url: str):
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "audio.mp3")
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": audio_path,
+            "quiet": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+
+        segments, _ = model.transcribe(audio_path)
+
+        text = " ".join(seg.text for seg in segments)
+
+        return text.strip() or None
+
+
+# ---------------------------
+# MAIN TRANSCRIPT FUNCTION
 # ---------------------------
 async def get_transcript(video_id: str) -> tuple[list, str]:
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
     def _fetch():
+        # 1. Try yt-dlp captions
         try:
-            api = YouTubeTranscriptApi()
-
-            # NEW API (v1.2+)
-            try:
-                fetched = api.fetch(video_id)
-
-                return [
-                    {
-                        "text": s.text,
-                        "start": s.start,
-                        "duration": s.duration,
-                    }
-                    for s in fetched
-                ]
-
-            except Exception as e:
-                logger.warning(f"New API failed, fallback used: {e}")
-
-            # FALLBACK (older behavior)
-            return YouTubeTranscriptApi.get_transcript(
-                video_id,
-                languages=["en", "en-US", "en-GB"]
-            )
-
-        except TranscriptsDisabled:
-            raise ValueError("Transcripts are disabled for this video.")
-
-        except NoTranscriptFound:
-            raise ValueError("No transcript found for this video.")
-
+            text = _yt_dlp_captions(url)
+            if text:
+                return [{"text": text, "start": 0}], text
         except Exception as e:
-            raise ValueError(f"Could not get transcript: {e}")
+            logger.warning(f"yt-dlp captions failed: {e}")
 
-    transcript_list = await asyncio.to_thread(_fetch)
+        # 2. Whisper fallback
+        try:
+            text = _whisper_transcribe(url)
+            if text:
+                return [{"text": text, "start": 0}], text
+        except Exception as e:
+            logger.error(f"Whisper failed: {e}")
 
-    # normalize safely
-    full_text = " ".join(
-        str(entry.get("text", "") if isinstance(entry, dict) else getattr(entry, "text", ""))
-        for entry in transcript_list
-    ).strip()
+        raise ValueError("No transcript available for this video.")
 
-    return transcript_list, full_text
+    return await asyncio.to_thread(_fetch)
 
 
 # ---------------------------
@@ -100,11 +126,7 @@ async def get_video_title(video_id: str) -> str:
             f"?url=https://youtube.com/watch?v={video_id}&format=json"
         )
 
-        response = await asyncio.to_thread(
-            requests.get,
-            url,
-            timeout=10
-        )
+        response = await asyncio.to_thread(requests.get, url, timeout=10)
 
         if response.status_code == 200:
             return response.json().get("title", f"Video {video_id}")
@@ -116,7 +138,7 @@ async def get_video_title(video_id: str) -> str:
 
 
 # ---------------------------
-# MAIN VIDEO INFO
+# MAIN INFO
 # ---------------------------
 async def get_video_info(url: str) -> dict:
     video_id = extract_video_id(url)
@@ -127,28 +149,25 @@ async def get_video_info(url: str) -> dict:
     title = await get_video_title(video_id)
     transcript_list, full_text = await get_transcript(video_id)
 
-    if not full_text:
-        raise ValueError("Transcript empty.")
-
     return {
         "video_id": video_id,
         "url": url,
         "title": title,
         "transcript_list": transcript_list,
         "transcript_text": full_text,
-        "duration_estimate": transcript_list[-1].get("start", 0) if transcript_list else 0,
+        "duration_estimate": 0,
     }
 
 
 # ---------------------------
-# TIMESTAMP FORMATTER
+# TIMESTAMP
 # ---------------------------
 def format_timestamp(seconds: float) -> str:
     return f"{int(seconds//60):02d}:{int(seconds%60):02d}"
 
 
 # ---------------------------
-# PLAYLIST FETCH
+# PLAYLIST (UNCHANGED SAFE)
 # ---------------------------
 async def get_playlist_videos(playlist_url: str) -> list[dict]:
     playlist_id = extract_playlist_id(playlist_url)
